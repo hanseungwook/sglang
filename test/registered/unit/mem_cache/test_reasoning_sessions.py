@@ -560,10 +560,33 @@ class ConfigurationTests(unittest.TestCase):
         )
 
     def test_supported_config_and_default_off(self):
-        config_module.validate_reasoning_eviction_config(self.config())
+        for backend in ("triton", "fa3"):
+            for explicit in (False, True):
+                cfg = self.config()
+                cfg.attention_backend = backend
+                if explicit:
+                    cfg.prefill_attention_backend = backend
+                    cfg.decode_attention_backend = backend
+                with self.subTest(backend=backend, explicit=explicit):
+                    config_module.validate_reasoning_eviction_config(cfg)
         config_module.validate_reasoning_eviction_config(
             SimpleNamespace(enable_reasoning_kv_eviction=False)
         )
+
+    def test_mixed_attention_backends_fail_closed(self):
+        for backend in ("triton", "fa3"):
+            for phase in ("prefill_attention_backend", "decode_attention_backend"):
+                for other in ("triton", "fa3", "flashinfer", "fa4"):
+                    if other == backend:
+                        continue
+                    cfg = self.config()
+                    cfg.attention_backend = backend
+                    setattr(cfg, phase, other)
+                    with (
+                        self.subTest(backend=backend, phase=phase, other=other),
+                        self.assertRaisesRegex(ValueError, phase),
+                    ):
+                        config_module.validate_reasoning_eviction_config(cfg)
 
     def test_unsupported_configs_fail_closed(self):
         for name, value in (

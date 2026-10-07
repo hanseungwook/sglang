@@ -12,7 +12,6 @@ def validate_reasoning_eviction_config(cfg):
         "pp_size": 1,
         "dp_size": 1,
         "dcp_size": 1,
-        "attention_backend": "triton",
         "disaggregation_mode": "null",
         "disable_radix_cache": False,
         "device": "cuda",
@@ -20,6 +19,9 @@ def validate_reasoning_eviction_config(cfg):
     for name, expected in required.items():
         if getattr(cfg, name) != expected:
             raise ValueError(f"Reasoning KV eviction requires {name}={expected!r}")
+    backend = cfg.attention_backend
+    if backend not in ("triton", "fa3"):
+        raise ValueError("Reasoning KV eviction requires triton or fa3 attention")
     for name in (
         "enable_hierarchical_cache",
         "enable_lmcache",
@@ -64,5 +66,5 @@ def validate_reasoning_eviction_config(cfg):
             "Reasoning KV eviction requires both CUDA graph backends disabled"
         )
     for name in ("prefill_attention_backend", "decode_attention_backend"):
-        if getattr(cfg, name, None) not in (None, "triton"):
-            raise ValueError(f"Reasoning KV eviction requires {name}=triton")
+        if getattr(cfg, name, None) not in (None, backend):
+            raise ValueError(f"Reasoning KV eviction requires {name}={backend}")

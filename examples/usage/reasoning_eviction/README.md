@@ -42,7 +42,9 @@ current turn's full reasoning.
 
 Use this fork with dependencies matching `python/pyproject.toml`. The initial
 configuration is dense, text-only `K2HorizonForCausalLM`, BF16 weights and KV,
-one CUDA GPU, Triton attention, eager execution, and one tokenizer worker.
+one CUDA GPU, Triton or FA3 attention, eager execution, and one tokenizer worker.
+FA3 is supported on Hopper (including H200). If prefill/decode backends are
+specified separately, both must match the selected attention backend.
 Pass a checkpoint compatible with the fork's native Horizon loader:
 
 ```bash
@@ -50,7 +52,7 @@ PYTHONPATH=python python -m sglang.launch_server \
   --model-path /path/to/dense-horizon-checkpoint \
   --model-impl sglang \
   --dtype bfloat16 \
-  --attention-backend triton \
+  --attention-backend fa3 \
   --enable-deterministic-inference \
   --enable-streaming-session \
   --enable-reasoning-kv-eviction \
@@ -222,6 +224,26 @@ cache, with the feature disabled; both native warm and native cold outputs
 matched their corresponding full-history session outputs exactly. These
 results establish functional smoke coverage, not strict numerical parity or
 benchmark accuracy.
+
+FA3 was additionally tested on H200 with the same 0.9B revision and 3.7B
+revision `d6e5432c59637093c0e125e791d89ea4a0b53559` (the anti-doom-loop
+release), at their native 131,072/524,288 context settings. Both passed native
+versus session first-turn greedy agreement, real W1/W8 page reclamation,
+tool-message continuation, and trimmed-search final-answer checks; concurrency
+was four for 0.9B and one for 3.7B. These are short trajectories on servers
+configured for the native limits, not full-length context qualification.
+
+The FA3 attention check compares actual compacted BF16 KV against dense FP32
+attention over the original, expiry-masked keys. It covers full/W1/W8, decode
+and chunked prefill, nontrivial physical page mappings, page sizes 1/64, and
+head dimensions 64/128. All 48 cases passed `atol=0.005, rtol=0.01`; the maximum
+absolute error was 0.00435. Allocation records are test doubles. This does not
+establish full-model masked-reference logit parity or benchmark quality.
+
+```bash
+python examples/usage/reasoning_eviction/qualify_fa3_attention.py \
+  --output /path/to/fa3-attention-results.json
+```
 
 The standalone CPU trace evaluator remains available:
 
