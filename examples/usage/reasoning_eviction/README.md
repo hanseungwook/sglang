@@ -4,13 +4,13 @@ This opt-in runtime adds session-owned KV compaction, original RoPE positions,
 and chronological recovery for multi-turn Horizon inference. The client sends
 new token IDs and message boundaries; the server owns retention and replay.
 
-**Validation status:** pretrained `IFM/K2-Horizon-0.9B` runs on an H200 with
-this fork. All 15 warm/cold comparisons across five windows produced identical
-greedy tokens, and restart recovery restored the saved retry response and
-matched continuation tokens. Strict sampled-logprob parity is still failing;
-the full-history difference also reproduces exactly in native SGLang with
-this feature disabled. This remains experimental. Full masked-reference
-parity, stress tests, and performance are not qualified.
+**Validation status:** both 0.9B and 3.7B Horizon run with FA3 on H200 and pass
+the session/compaction smoke checks below. The initial 0.9B Triton test passed
+15 warm/cold greedy comparisons and restart recovery, but failed strict
+sampled-logprob parity. With FA3, 0.9B cache rebuilding can also change greedy
+reasoning text; a native control with eviction disabled reproduces that token
+difference. This remains experimental. Full masked-reference model parity,
+stress tests, and performance are not qualified.
 
 ## Policy
 
@@ -239,6 +239,20 @@ and chunked prefill, nontrivial physical page mappings, page sizes 1/64, and
 head dimensions 64/128. All 48 cases passed `atol=0.005, rtol=0.01`; the maximum
 absolute error was 0.00435. Allocation records are test doubles. This does not
 establish full-model masked-reference logit parity or benchmark quality.
+
+The FA3 0.9B warm/cold qualification does not pass strict greedy or sampled-
+logprob parity. A full-history example changed reasoning wording after rebuild
+while preserving the final answer (45). An ordinary `/generate` control with
+the eviction feature disabled reproduced the same warm/cold token sequences.
+Native versus session cold logprobs matched exactly; their warm logprobs differed
+by at most 0.0576, so exact numerical equivalence is not claimed. Preserve the
+replay flag in evaluation traces when analyzing cache-loss effects.
+
+The updated 3.7B FA3 checkpoint passed all 15 warm/cold comparisons across
+full/W0/W1/W8/oversized windows, including idempotent retries, with identical
+greedy token IDs and sampled logprobs. This paired test used four request rows
+to keep both sessions resident; a single-row server necessarily evicts the
+other session when alternating between the pair.
 
 ```bash
 python examples/usage/reasoning_eviction/qualify_fa3_attention.py \
