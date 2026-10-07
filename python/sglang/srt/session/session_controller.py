@@ -96,6 +96,11 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        # Managed by ReasoningSessionService; these histories never enter radix.
+        self.reasoning_owned = False
+        self.reasoning_cache_lost = False
+        self.reasoning_position_offset = 0
+        self.reasoning_busy = False
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -218,7 +223,10 @@ class Session:
         abort_message = ""
         if self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
-            if self._inflight:
+            if self.reasoning_cache_lost:
+                abort = True
+                abort_message = "Reasoning session KV was evicted; replay required."
+            elif self._inflight:
                 abort = True
                 abort_message = "Streaming session already has an active request."
             elif session_params.replace:
@@ -266,7 +274,8 @@ class Session:
 
         carry_fill = None
         if last_req is not None:
-            self._strip_bos_token(req, tokenizer)
+            if not self.reasoning_owned:
+                self._strip_bos_token(req, tokenizer)
             # In-place sharing is only safe for the plain streaming append:
             # streaming sessions allow a single inflight request, last_req has
             # finished, and the committed_* lengths recorded by finish_req let
@@ -333,6 +342,9 @@ class Session:
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
+        new_req.reasoning_position_offset = self.reasoning_position_offset
+        if self.reasoning_owned:
+            new_req.skip_radix_cache_insert = True
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
 

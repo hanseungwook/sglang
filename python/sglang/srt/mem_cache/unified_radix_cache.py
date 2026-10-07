@@ -649,6 +649,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 mamba_num=mamba_id_shortfall,
             )
         result = self._evict(initial_params, available_size_targets)
+        full_target = available_size_targets.get(ComponentType.FULL)
+        if full_target is not None:
+            shortfall = full_target[1] - self._component_available_size(
+                ComponentType.FULL
+            )
+            if shortfall > 0:
+                result.num_tokens_evicted += self.session.evict_idle_reasoning_sessions(
+                    shortfall
+                )
 
         if mamba_target is not None and mamba_full_donor is not None:
             mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
@@ -3581,6 +3590,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
+
+    def reasoning_session_evictable_size(self) -> int:
+        return self.session.idle_reasoning_size()
 
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()

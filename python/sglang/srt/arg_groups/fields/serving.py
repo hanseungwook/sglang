@@ -271,6 +271,14 @@ class Serving(msgspec.Struct):
     enable_streaming_session: A[
         bool, "Enable streaming session mode and StreamingSession wrapper."
     ] = False
+    enable_reasoning_kv_eviction: A[
+        bool,
+        "Enable experimental session-owned reasoning KV eviction (Horizon, BF16, TP1, eager).",
+    ] = False
+    reasoning_session_store: A[
+        Optional[str],
+        "Directory for atomic reasoning-session transcripts and retry results.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Constrained decoding

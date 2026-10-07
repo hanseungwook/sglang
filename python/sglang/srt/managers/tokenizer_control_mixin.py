@@ -58,6 +58,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReasoningSessionControlOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -107,6 +108,7 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("reasoning_session", ReasoningSessionControlOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -178,6 +180,12 @@ class TokenizerControlMixin:
     profile, internal state, etc.) -- everything that talks to the scheduler via
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
+
+    def _check_reasoning_weight_update(self):
+        if get_serving().enable_reasoning_kv_eviction:
+            raise ValueError(
+                "Weight updates are unsupported with reasoning KV eviction; restart with the new checkpoint"
+            )
 
     def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
@@ -467,6 +475,7 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
+        self._check_reasoning_weight_update()
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -501,6 +510,7 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._check_reasoning_weight_update()
         self.auto_create_handle_loop()
         assert get_parallel().dp_size == 1, (
             "data-parallel replicas are not supported for update weights from distributed"
@@ -561,6 +571,7 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._check_reasoning_weight_update()
         self.auto_create_handle_loop()
         assert get_parallel().dp_size == 1, (
             "data-parallel replicas are not supported for update weights from tensor"
@@ -597,6 +608,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
+        self._check_reasoning_weight_update()
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance

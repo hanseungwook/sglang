@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_lora,
     get_parallel,
+    get_serving,
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -1171,6 +1172,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+        if get_serving().enable_reasoning_kv_eviction:
+            from sglang.srt.session.reasoning_ops import apply_reasoning_positions
+
+            ret.positions = apply_reasoning_positions(
+                ret.positions,
+                batch.reqs,
+                None if ret.forward_mode.is_decode() else ret.extend_seq_lens_cpu,
+            )
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)

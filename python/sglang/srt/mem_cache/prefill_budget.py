@@ -91,7 +91,10 @@ class PrefillBudget:
             if self.tree_cache.supports_mamba()
             else self.tree_cache.evictable_size()
         )
-        return self.allocator.available_size() + evictable
+        replayable = getattr(
+            self.tree_cache, "reasoning_session_evictable_size", lambda: 0
+        )()
+        return self.allocator.available_size() + evictable + replayable
 
     @property
     def remaining_total(self):

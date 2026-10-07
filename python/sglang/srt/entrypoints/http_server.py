@@ -1627,6 +1627,46 @@ async def unload_lora_adapter(
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
+@app.post("/reasoning_sessions/open")
+async def open_reasoning_session(obj: dict):
+    from sglang.srt.session.reasoning_backend import get_reasoning_service
+
+    try:
+        if set(obj) - {"window"}:
+            raise ValueError("Only the fixed session window may be set at open")
+        return get_reasoning_service(_global_state.tokenizer_manager).open(
+            obj.get("window")
+        )
+    except ValueError as error:
+        return _create_error_response(error)
+
+
+@app.post("/reasoning_sessions/{session_id}/generate")
+async def generate_reasoning_session(session_id: str, obj: dict):
+    from sglang.srt.session.reasoning_backend import get_reasoning_service
+
+    try:
+        service = get_reasoning_service(_global_state.tokenizer_manager)
+        return await service.generate(session_id, **obj)
+    except (ValueError, TypeError) as error:
+        return _create_error_response(error)
+    except asyncio.CancelledError:
+        return Response(status_code=499)
+
+
+@app.post("/reasoning_sessions/{session_id}/{operation}")
+async def control_reasoning_session(session_id: str, operation: str):
+    from sglang.srt.session.reasoning_backend import get_reasoning_service
+
+    try:
+        service = get_reasoning_service(_global_state.tokenizer_manager)
+        if operation not in ("evict", "cancel", "close"):
+            raise ValueError("Unknown reasoning session operation")
+        return await getattr(service, operation)(session_id)
+    except ValueError as error:
+        return _create_error_response(error)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""

@@ -44,6 +44,7 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    owner_session: Any = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -92,6 +93,17 @@ class StreamingSession:
         otherwise None (caller falls back to its raw match)."""
         slot = self.find_active_slot(params.req)
         if slot is None:
+            if _is_streaming(params.req) and getattr(
+                params.req.session, "reasoning_owned", False
+            ):
+                node = _VirtualNode()
+                return MatchResult(
+                    device_indices=self.cache.tree_core.empty_match_result.device_indices,
+                    last_device_node=node,
+                    last_host_node=node,
+                    best_match_node=node,
+                    cache_protected_len=0,
+                )
             return None
 
         req = params.req
@@ -162,6 +174,20 @@ class StreamingSession:
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
+        if getattr(req.session, "reasoning_owned", False) and (
+            isinstance(req.finished_reason, FINISH_ABORT) or not req.finished()
+        ):
+            # A shortened transcript is never a valid retraction fallback.
+            # The coordinator retains the full history and reconstructs it.
+            self.release_session(req.session.session_id)
+            req.detach_kv()
+            req.session.reasoning_cache_lost = True
+            req.session.abort_req()
+            if not req.finished():
+                req.to_finish = FINISH_ABORT(
+                    "Reasoning session retracted; replay required", status_code=503
+                )
+            return True
         if isinstance(req.finished_reason, FINISH_ABORT):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
@@ -216,7 +242,11 @@ class StreamingSession:
             return
         session_id = req.session.session_id
         assert session_id not in self.slots, f"{session_id=} already has a slot"
-        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        slot = SessionSlot(
+            kv=req.kv,
+            publishes_prompt=not getattr(req.session, "reasoning_owned", False),
+            owner_session=req.session,
+        )
         self._lock_to_slot(req, slot)
         self.slots[session_id] = slot
 
@@ -228,6 +258,43 @@ class StreamingSession:
         return slot if slot is not None and slot.kv is req.kv else None
 
     # -- Session lifecycle --
+
+    def evict_idle_reasoning_sessions(
+        self, num_tokens: int, *, num_rows: int = 0
+    ) -> int:
+        """Release whole idle caches; their coordinator keeps replayable history."""
+        if num_tokens <= 0 and num_rows <= 0:
+            return 0
+        freed = 0
+        rows = 0
+        for session_id, slot in list(self.slots.items()):
+            owner = slot.owner_session
+            if (
+                owner is None
+                or not getattr(owner, "reasoning_owned", False)
+                or owner._inflight
+                or owner.reasoning_busy
+                or not slot.kv.holds_kv
+            ):
+                continue
+            freed += ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
+            owner.reasoning_cache_lost = True
+            self.release_session(session_id)
+            rows += 1
+            if freed >= num_tokens and rows >= num_rows:
+                break
+        return freed
+
+    def idle_reasoning_size(self) -> int:
+        return sum(
+            ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
+            for slot in self.slots.values()
+            if slot.owner_session is not None
+            and getattr(slot.owner_session, "reasoning_owned", False)
+            and not slot.owner_session._inflight
+            and not slot.owner_session.reasoning_busy
+            and slot.kv.holds_kv
+        )
 
     def release_session(self, session_id: str) -> None:
         slot = self.slots.pop(session_id, None)

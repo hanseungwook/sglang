@@ -163,6 +163,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    ReasoningSessionControlInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1717,6 +1718,7 @@ class Scheduler(
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
+                (ReasoningSessionControlInput, self.reasoning_session_control),
                 (CloseSessionReqInput, self.close_session),
                 (
                     UpdateWeightFromDiskReqInput,
@@ -2537,7 +2539,10 @@ class Scheduler(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len
+                - input_len
+                - getattr(req, "reasoning_position_offset", 0)
+                - 1,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -3028,6 +3033,18 @@ class Scheduler(
 
         # initialize before returning
         self.init_req_max_new_tokens(req)
+
+        # Compaction does not extend the model's original position limit.
+        if (
+            getattr(req, "reasoning_position_offset", 0)
+            and len(req.origin_input_ids) + req.reasoning_position_offset
+            >= self.max_req_input_len
+        ):
+            req.set_finish_with_abort(
+                "Reasoning session exceeds the absolute context limit"
+            )
+            self._add_request_to_queue(req)
+            return
 
         # Validate prompt length
         error_msg = validate_input_length(
@@ -3795,6 +3812,13 @@ class Scheduler(
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
+        if get_serving().enable_reasoning_kv_eviction:
+            from sglang.srt.session.reasoning_ops import has_reasoning_session_row
+
+            available += sum(
+                has_reasoning_session_row(self.tree_cache, req)
+                for req in self.waiting_queue
+            )
 
         active_batch = running_batch or self.running_batch
         available = max(
@@ -3845,7 +3869,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
+        if (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or get_serving().enable_reasoning_kv_eviction
+        ):
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
@@ -3855,6 +3883,21 @@ class Scheduler(
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
+        if get_serving().enable_reasoning_kv_eviction:
+            from sglang.srt.session.reasoning_ops import prefill_row_cost
+
+            # Idle sessions can exhaust request rows even when KV has room.
+            # Continuing sessions already own their row; reclaim only the rows
+            # needed for new requests in this scheduling pass.
+            needed = min(
+                max(0, get_parallel().pp_max_micro_batch_size - running_bs),
+                sum(
+                    prefill_row_cost(self.tree_cache, req) for req in self.waiting_queue
+                ),
+            )
+            self.tree_cache.session.evict_idle_reasoning_sessions(
+                0, num_rows=needed - self.req_to_token_pool.available_size()
+            )
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
@@ -3974,6 +4017,19 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            if get_serving().enable_reasoning_kv_eviction:
+                # Borrowed rows contribute to batch capacity but cannot be
+                # allocated by a different request. Skip a blocked new request
+                # so queued session continuations can still make progress.
+                needed = sum(
+                    prefill_row_cost(self.tree_cache, candidate)
+                    for candidate in (*adder.can_run_list, req)
+                )
+                available = self.req_to_token_pool.available_size() - (
+                    self.beam_coordinator.pending_member_rows(running_batch)
+                )
+                if needed > available:
+                    continue
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
@@ -5721,6 +5777,11 @@ class Scheduler(
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()
+
+    def reasoning_session_control(self, recv_req):
+        from sglang.srt.session.reasoning_ops import handle_reasoning_control
+
+        return handle_reasoning_control(self, recv_req)
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)

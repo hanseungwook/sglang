@@ -2320,6 +2320,18 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class ReasoningSessionControlInput(BaseReq, kw_only=True):
+    action: str
+    session_id: str
+    payload: Dict[str, Any] = msgspec.field(default_factory=dict)
+
+
+class ReasoningSessionControlOutput(BaseReq, kw_only=True):
+    success: bool
+    data: Dict[str, Any] = msgspec.field(default_factory=dict)
+    error: Optional[str] = None
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

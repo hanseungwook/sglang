@@ -535,6 +535,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        if get_serving().enable_reasoning_kv_eviction:
+            from sglang.srt.session.reasoning_backend import get_reasoning_service
+
+            get_reasoning_service(self)
+
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
@@ -2187,6 +2192,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._check_reasoning_weight_update()
         self.auto_create_handle_loop()
 
         if obj.load_format is None:
