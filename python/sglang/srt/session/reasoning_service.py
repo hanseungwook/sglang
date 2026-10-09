@@ -35,6 +35,22 @@ class ReplayRequired(ValueError):
     status_code = 503
 
 
+def copy_record_for_append(record):
+    """Isolate a transaction's mutable history without copying old responses.
+
+    Committed response values, policy, identity and event entries are immutable
+    inside the service. API responses are deep-copied on return. Token/message
+    containers and the result dictionary are private to each attempt; events
+    are replaced after execution, never mutated in place.
+    """
+    return {
+        **record,
+        "token_ids": list(record["token_ids"]),
+        "messages": [dict(message) for message in record["messages"]],
+        "results": dict(record["results"]),
+    }
+
+
 class ReasoningSessionService:
     def __init__(
         self,
@@ -277,7 +293,7 @@ class ReasoningSessionService:
             raise ValueError(
                 "Request exceeds the model's original context-position limit"
             )
-        candidate = copy.deepcopy(record)
+        candidate = copy_record_for_append(record)
         offset = len(record["token_ids"])
         continuing = bool(
             record["messages"] and not record["messages"][-1]["completed"]
@@ -359,7 +375,7 @@ class ReasoningSessionService:
             for attempt in range(2):
                 try:
                     response, updated = await self._execute(
-                        session_id, record, copy.deepcopy(candidate), params
+                        session_id, record, copy_record_for_append(candidate), params
                     )
                     break
                 except ReplayRequired:

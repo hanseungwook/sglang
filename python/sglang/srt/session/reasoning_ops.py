@@ -45,8 +45,10 @@ def compact_session(cache, session, *, keep_indices, expected_length, expected_o
     """Compact an idle, fully committed session; retain partial tail-page ownership.
 
     The coordinator has teacher-forced the terminal token in a prefill-only
-    request. All layers gather before overwriting their own source rows. CUDA
-    synchronization deliberately trades boundary latency for stream safety in v1.
+    request. Only the suffix after the first hole moves; the preceding KV is
+    already in its destination slots. Each layer gathers that entire suffix
+    before writing, including when its source and destination overlap. CUDA
+    synchronization deliberately trades boundary latency for stream safety.
     """
     if not session.reasoning_owned or session._inflight:
         raise ValueError("Compaction requires an idle reasoning-owned session")
@@ -68,16 +70,21 @@ def compact_session(cache, session, *, keep_indices, expected_length, expected_o
         )
     if kv.kv_committed_len != expected_length or kv.kv_allocated_len != expected_length:
         raise ValueError("Commit every token before reasoning compaction")
-    if (
-        not keep_indices
-        or any(type(i) is not int for i in keep_indices)
-        or list(keep_indices) != sorted(set(keep_indices))
-        or keep_indices[0] < 0
-        or keep_indices[-1] != expected_length - 1
-    ):
+    if not keep_indices or keep_indices[-1] != expected_length - 1:
         raise ValueError(
             "Compaction must preserve ordered indices and the terminal token"
         )
+    count = len(keep_indices)
+    first_moved = count
+    previous = -1
+    for destination, source in enumerate(keep_indices):
+        if type(source) is not int or source <= previous:
+            raise ValueError(
+                "Compaction must preserve ordered indices and the terminal token"
+            )
+        if first_moved == count and source != destination:
+            first_moved = destination
+        previous = source
     req = next(iter(session.req_nodes.values())).req
     if len(req.origin_input_ids) != expected_length or req.output_ids:
         raise ValueError("Compaction requires a completed prefill-only request")
@@ -94,24 +101,24 @@ def compact_session(cache, session, *, keep_indices, expected_length, expected_o
         for buf in (*pool.k_buffer, *pool.v_buffer)
     ):
         raise ValueError("Reasoning compaction requires BF16 KV")
-    count = len(keep_indices)
-    row = cache.req_to_token_pool.req_to_token[kv.req_pool_idx]
-    src = row[row.new_tensor(keep_indices, dtype=torch.long)].long()
-    dst = row[:count].long()
-    if src.is_cuda:
-        torch.cuda.synchronize(src.device)
-    if count != expected_length:
+    if first_moved < count:
+        row = cache.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        src = row[row.new_tensor(keep_indices[first_moved:], dtype=torch.long)].long()
+        dst = row[first_moved:count].long()
+        if src.is_cuda:
+            torch.cuda.synchronize(src.device)
         for buffers in (pool.k_buffer, pool.v_buffer):
             for buf in buffers:
                 buf[dst] = buf[src]  # advanced indexing materializes the RHS first
-    if src.is_cuda:
-        torch.cuda.synchronize(src.device)
+        if src.is_cuda:
+            torch.cuda.synchronize(src.device)
     page_size = cache.page_size
     free_start = (count + page_size - 1) // page_size * page_size
     if free_start < expected_length:
         cache.free_kv_row(kv, [(free_start, expected_length)])
     kv.kv_allocated_len = kv.kv_committed_len = count
-    retained = array("q", (req.origin_input_ids[i] for i in keep_indices))
+    retained = array("q", req.origin_input_ids[:first_moved])
+    retained.extend(req.origin_input_ids[i] for i in keep_indices[first_moved:])
     req.origin_input_ids = retained
     req.origin_input_ids_unpadded = retained
     req.full_untruncated_fill_ids = array("q", retained)

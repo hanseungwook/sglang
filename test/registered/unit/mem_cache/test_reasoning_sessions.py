@@ -4,6 +4,7 @@ import asyncio
 import copy
 import importlib.util
 import os
+import random
 import sys
 import tempfile
 import unittest
@@ -363,6 +364,55 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.records[sid]["token_ids"], [])
         self.assertEqual(service.backend.sessions, {})
 
+    async def test_later_failed_transaction_preserves_history_and_retry_results(self):
+        service = make_service()
+        sid = service.open(8)["session_id"]
+        first = await run_turn(service, sid, turns()[0])
+        committed = copy.deepcopy(service.records[sid])
+        # Mutating a caller's response must not mutate the cached retry value.
+        first["output_ids"].clear()
+        first["meta_info"]["reasoning_eviction"]["window"] = 999
+        with patch.object(service, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                await run_turn(service, sid, turns()[1], "failed-second")
+        self.assertEqual(service.records[sid], committed)
+        turn = turns()[0]
+        retry = await service.generate(
+            sid,
+            request_id="first",
+            input_ids=turn["input_ids"],
+            messages=turn["messages"],
+            sampling_params={"max_new_tokens": 32},
+        )
+        self.assertEqual(retry, committed["results"]["first"]["response"])
+        await run_turn(service, sid, turns()[1], "second")
+        self.assertEqual(
+            committed["results"]["first"], service.records[sid]["results"]["first"]
+        )
+        self.assertEqual(len(service.records[sid]["results"]), 2)
+
+    async def test_failed_incomplete_continuation_preserves_previous_boundary(self):
+        service = make_service()
+        sid = service.open(1)["session_id"]
+        turn = turns()[0]
+        service.backend.outputs.append((turn["output"][:3], "length"))
+        await service.generate(
+            sid,
+            request_id="partial",
+            input_ids=turn["input_ids"],
+            messages=turn["messages"],
+            sampling_params={"max_new_tokens": 3},
+        )
+        committed = copy.deepcopy(service.records[sid])
+        service.backend.outputs.append((turn["output"][3:], "stop"))
+        with patch.object(service, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                await service.generate(
+                    sid, request_id="finish", input_ids=[], messages=[]
+                )
+        self.assertEqual(service.records[sid], committed)
+        self.assertFalse(service.records[sid]["messages"][-1]["completed"])
+
     async def test_context_limit_uses_full_history(self):
         service = make_service()
         sid = service.open(0)["session_id"]
@@ -479,6 +529,12 @@ class PoolTests(unittest.TestCase):
             "missing_terminal",
             "duplicate",
             "inflight",
+            "negative",
+            "unordered",
+            "bool",
+            "float",
+            "out_of_range",
+            "empty",
         ):
             cache, session, pool, _, freed = self.pool_fixture(17, 4)
             kv = cache.session.slots["test"].kv
@@ -496,6 +552,14 @@ class PoolTests(unittest.TestCase):
                 keep = [0, 0, 16]
             if kind == "inflight":
                 session._inflight = True
+            keep = {
+                "negative": [-1, 16],
+                "unordered": [4, 1, 16],
+                "bool": [False, 16],
+                "float": [0, 16.0],
+                "out_of_range": [0, 18, 16],
+                "empty": [],
+            }.get(kind, keep)
             before = pool.k_buffer[0].clone()
             with self.subTest(kind=kind), self.assertRaises(ValueError):
                 ops.compact_session(
@@ -507,6 +571,93 @@ class PoolTests(unittest.TestCase):
                 )
             torch.testing.assert_close(pool.k_buffer[0], before)
             self.assertEqual(freed, [])
+
+    def test_repeated_random_compactions_match_full_gather_bitwise(self):
+        rng = random.Random(20261009)
+        for page in (1, 4, 64):
+            for trial in range(12):
+                length = rng.randrange(65, 160)
+                cache, session, pool, slots, freed = self.pool_fixture(length, page)
+                token_ids = list(range(length))
+                for step in range(4):
+                    prefix = rng.randrange(length)
+                    keep = [
+                        *range(prefix),
+                        *[i for i in range(prefix, length - 1) if rng.random() < 0.55],
+                        length - 1,
+                    ]
+                    original = [b.clone() for b in (*pool.k_buffer, *pool.v_buffer)]
+                    previous_offset = session.reasoning_position_offset
+                    result = ops.compact_session(
+                        cache,
+                        session,
+                        keep_indices=keep,
+                        expected_length=length,
+                        expected_offset=previous_offset,
+                    )
+                    for before, buf in zip(original, (*pool.k_buffer, *pool.v_buffer)):
+                        expected = before.clone()
+                        expected[slots[: len(keep)]] = before[[slots[i] for i in keep]]
+                        torch.testing.assert_close(buf, expected, rtol=0, atol=0)
+                    token_ids = [token_ids[i] for i in keep]
+                    self.assertEqual(
+                        list(session.req_nodes["last"].req.origin_input_ids), token_ids
+                    )
+                    self.assertEqual(
+                        result["next_absolute_position"], length + previous_offset
+                    )
+                    self.assertEqual(len(freed), len(set(freed)))
+                    self.assertFalse(
+                        set(freed) & {slot // page for slot in slots[: len(keep)]}
+                    )
+                    length = len(keep)
+
+    def test_unchanged_prefix_is_not_read_or_written_and_noop_never_touches_gpu(self):
+        class ObservedBuffer:
+            def __init__(self, tensor):
+                self.tensor = tensor
+                self.dtype, self.ndim = tensor.dtype, tensor.ndim
+                self.reads, self.writes = [], []
+
+            def __getitem__(self, indices):
+                self.reads.extend(indices.tolist())
+                return self.tensor[indices]
+
+            def __setitem__(self, indices, values):
+                self.writes.extend(indices.tolist())
+                self.tensor[indices] = values
+
+        for noop in (False, True):
+            cache, session, pool, slots, _ = self.pool_fixture(100, 4)
+            pool.k_buffer = [ObservedBuffer(b) for b in pool.k_buffer]
+            pool.v_buffer = [ObservedBuffer(b) for b in pool.v_buffer]
+            keep = list(range(100)) if noop else [*range(90), 97, 98, 99]
+            if noop:
+                with patch.object(
+                    torch.cuda,
+                    "synchronize",
+                    side_effect=AssertionError("No-op synchronized GPU"),
+                ):
+                    ops.compact_session(
+                        cache,
+                        session,
+                        keep_indices=keep,
+                        expected_length=100,
+                        expected_offset=9,
+                    )
+            else:
+                ops.compact_session(
+                    cache,
+                    session,
+                    keep_indices=keep,
+                    expected_length=100,
+                    expected_offset=9,
+                )
+            for buf in (*pool.k_buffer, *pool.v_buffer):
+                self.assertEqual(
+                    buf.reads, [] if noop else [slots[i] for i in (97, 98, 99)]
+                )
+                self.assertEqual(buf.writes, [] if noop else slots[90:93])
 
     def test_positions_follow_filtered_merged_and_chunked_request_order(self):
         a, b, normal = [
